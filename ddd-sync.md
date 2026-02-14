@@ -17,17 +17,26 @@ Synchronize the DDD project specs with the current implementation state. This up
    - Update `implementedAt` timestamp if files have changed
    - Remove entries for flows that no longer have implementation files
 
-4. **Detect new patterns** (optional, if `--discover` flag):
+4. **Detect new patterns** (if `--discover` or `--full` flag):
    - Scan `src/` for route handlers, services, models that don't have corresponding flow specs
    - Suggest which DDD flows should be created for untracked code
    - If the user agrees, create new flow YAML specs under `specs/domains/`
 
-5. **Report**:
+5. **Fix drift** (if `--fix-drift` or `--full` flag):
+   - For each flow where the spec has changed since implementation (specHash mismatch), re-implement:
+     - Read the updated flow spec
+     - Read the existing implementation files from mapping
+     - Update the implementation to match the new spec
+     - Run tests and fix until passing
+     - Update mapping.yaml with new specHash and timestamp
+
+6. **Report**:
    - Show a summary of what was synced:
      - Flows with up-to-date specs
      - Flows with spec drift (spec changed since implementation)
      - Flows with missing implementation
-     - (If --discover) Untracked code that should become flows
+     - (If --discover or --full) Untracked code that should become flows
+     - (If --fix-drift or --full) Flows that were re-implemented
 
 ## Usage
 
@@ -35,5 +44,6 @@ The user will say something like:
 - `/ddd-sync` — sync mapping.yaml with current implementation state
 - `/ddd-sync --discover` — also discover untracked code and suggest new flow specs
 - `/ddd-sync --fix-drift` — re-implement flows where specs have drifted from implementation
+- `/ddd-sync --full` — do all of the above: sync mapping, discover untracked code, and fix drifted flows
 
 $ARGUMENTS
