@@ -33,7 +33,9 @@ Parse the argument to determine scope:
    - `specs/architecture.yaml` — conventions, infrastructure, API design (if exists)
    - `specs/config.yaml` — environment variable schema (if exists)
    - `specs/shared/errors.yaml` — error codes with HTTP status mappings (if exists)
+   - `specs/shared/types.yaml` — shared enum/type definitions (if exists)
    - `specs/schemas/*.yaml` — data model definitions referenced by data_store nodes in the flow (if exist)
+   - Note: `system.yaml` may contain an `integrations:` section with external API configs
    - `specs/domains/{domain}/domain.yaml` — domain context, events, relationships
    - `specs/domains/{domain}/flows/{flow}.yaml` — the flow specification
 
@@ -72,7 +74,7 @@ Parse the argument to determine scope:
 
    **Entry point — determine from trigger convention**:
    - `HTTP {METHOD} {path}` → route handler (e.g., Express route, FastAPI endpoint)
-   - `cron {expression}` → scheduled job (e.g., node-cron, BullMQ repeatable)
+   - `cron {expression}` → scheduled job (e.g., node-cron, BullMQ repeatable). If the trigger has `job_config`, configure the job queue (e.g., BullMQ) with the specified concurrency, timeout, retry, and dead_letter settings
    - `event:{EventName}` → event listener/consumer (e.g., message queue subscriber)
    - `webhook {path}` → webhook handler route
    - `manual` → CLI command or admin endpoint
@@ -81,11 +83,11 @@ Parse the argument to determine scope:
    - `process` → service function call
    - `decision` → if/else or switch using the `condition` field
    - `data_store` → database query (ORM call matching `operation`: create/read/update/delete on `model`)
-   - `service_call` → HTTP client call (method, url, headers, body, timeout, retry)
+   - `service_call` → HTTP client call (method, url, headers, body, timeout, retry). If `system.yaml` has an `integrations:` section and the service_call URL matches an integration's `base_url`, use the integration's auth, retry, and rate limit config
    - `event` → event emission (emit) or subscription handler (consume)
    - `loop` → for/forEach over `collection` with `iterator` variable, optional `break_condition`
    - `parallel` → Promise.all / concurrent execution of branches
-   - `sub_flow` → call to the referenced flow's entry function
+   - `sub_flow` → call to the referenced flow's entry function. If the target flow has a `contract` section, validate that `input_mapping` keys match contract inputs and `output_mapping` keys match contract outputs
    - `llm_call` → LLM API call with model, prompt, temperature, structured output
    - `agent_loop` → agent loop with tool dispatch, memory management, stop conditions
    - `guardrail` → validation middleware (inline, sequential — input guard before agent, output guard after)

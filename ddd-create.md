@@ -44,23 +44,26 @@ Create a complete DDD (Design Driven Development) project from a software projec
    - `specs/architecture.yaml` — project structure, naming conventions, dependencies, infrastructure, API design, testing, deployment
    - `specs/config.yaml` — required and optional environment variables
    - `specs/shared/errors.yaml` — error codes with HTTP status mappings (cover at least: VALIDATION_ERROR, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, DUPLICATE_ENTRY, RATE_LIMITED, INTERNAL_ERROR)
+   - `specs/shared/types.yaml` — shared enums and value objects (if project has enums reused across 2+ schemas)
    - `specs/schemas/_base.yaml` — base model fields (id, created_at, updated_at, deleted_at)
-   - `specs/schemas/{model}.yaml` — one per data model, with fields, indexes, relationships
+   - `specs/schemas/{model}.yaml` — one per data model, with fields, indexes, relationships. If a schema has a status/lifecycle field with defined transitions, add a `transitions:` section
+   - If the project has external API integrations, add an `integrations:` section to `specs/system.yaml` with base_url, auth, rate_limits, retry, and timeout_ms per integration
 
 6. **Create domain YAML files**: For each domain, create `specs/domains/{domain-id}/domain.yaml` with:
    - `name`, `description`
    - `flows` array (id, name, description, type)
-   - `publishes_events` and `consumes_events` (cross-domain event wiring)
+   - `publishes_events` and `consumes_events` (cross-domain event wiring). Include `payload` field in events to document event data shape
    - `layout` with flow positions (space flows vertically with ~200px gaps)
 
 7. **Create flow YAML files**: For each flow, create `specs/domains/{domain-id}/flows/{flow-id}.yaml` with:
    - `flow` metadata (id, name, type, domain, description)
    - `trigger` node with appropriate convention:
      - `HTTP {METHOD} {path}` for API endpoints
-     - `cron {expression}` for scheduled jobs
+     - `cron {expression}` for scheduled jobs. Add `job_config` to the trigger spec with queue, concurrency, timeout, and retry settings
      - `event:{EventName}` for event-driven flows
      - `webhook {path}` for webhook handlers
      - `manual` for admin-triggered flows
+   - For flows called as sub-flows, add a `contract` section to the flow metadata with `inputs` and `outputs`
    - `nodes` array — design the complete node graph:
      - Always start with `input` node after trigger for API flows (validate incoming data)
      - Use `decision` nodes for branching logic (always wire both `true` and `false`)
@@ -92,7 +95,10 @@ Create a complete DDD (Design Driven Development) project from a software projec
    - Terminal nodes have `status` and `body` for HTTP-triggered flows
    - Error terminals reference error codes from `specs/shared/errors.yaml`
    - Published events have matching consumers across domains (or note warnings)
+   - Event `payload` fields match between publisher and consumer across domains
    - Schema models referenced by `data_store` nodes exist in `specs/schemas/`
+   - Shared enums referenced by schemas exist in `specs/shared/types.yaml`
+   - `service_call` nodes reference integrations defined in `system.yaml` (if integrations section exists)
    - Agent flows have agent_loop with tools (at least one `is_terminal: true`)
 
 10. **Summary**: After creating all files, show:
