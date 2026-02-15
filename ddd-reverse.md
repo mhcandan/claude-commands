@@ -9,12 +9,28 @@ Parse `$ARGUMENTS` for:
 - `--output <path>` — where to write specs (default: same project directory)
 - `--domains <d1,d2>` — only reverse-engineer specific domains (partial mode)
 - `--merge` — merge with existing specs instead of overwriting
+- `--strategy <name>` — override auto-selected strategy (see below)
 
 If no project path is provided, ask the user for it.
 
-## Instructions
+## Strategy Selection
 
-### Phase 1: Fetch spec reference + detect tech stack
+Six strategies are available, each optimized for different codebase sizes. By default, auto-select based on source file count (excluding tests, configs, assets, node_modules, vendor, dist, build):
+
+| Strategy | Flag | Auto-selected when | Approach |
+|----------|------|--------------------|----------|
+| **Baseline** | `--strategy baseline` | < 30 source files | Read code directly, generate specs in-context |
+| **Index** | `--strategy index` | 30–80 files | Build in-context index first, process per-domain |
+| **Swap** | `--strategy swap` | 80–150 files | Write index layer to disk files, read selectively |
+| **Bottom-Up** | `--strategy bottom-up` | 150–300 files | Scan entry points first (L3), group into domains (L2), then system (L1) |
+| **Compiler** | `--strategy compiler` | 300–500 files | Multi-pass pipeline: scan → extract → resolve → IR → link → emit |
+| **Codex** | `--strategy codex` | 500+ files | Compress entire codebase to ref code vocabulary, build specs from ref chains |
+
+The user can override with `--strategy <name>`. If overriding, use the specified strategy regardless of file count.
+
+---
+
+## Phase 0: Setup (all strategies)
 
 1. **Fetch the DDD Usage Guide**: Run `gh api repos/mhcandan/DDD/contents/DDD-USAGE-GUIDE.md --jq '.content' | base64 -d` to get the latest version. This guide defines all YAML formats, node types, spec fields, connection patterns, and conventions. It is your primary reference for creating correct specs.
 
@@ -32,256 +48,514 @@ If no project path is provided, ask the user for it.
    - `Dockerfile` / `docker-compose.yml` / `docker-compose.yaml` — infrastructure, services
    - `Procfile` / `fly.toml` / `vercel.json` / `netlify.toml` — deployment config
 
-4. **Handle monorepos**: If the project root contains `packages/`, `apps/`, or a `workspaces` field in package.json, ask the user which package/app to reverse-engineer. If a `--domains` flag targets specific packages, proceed with those.
+4. **Handle monorepos**: If the project root contains `packages/`, `apps/`, or a `workspaces` field in package.json, ask the user which package/app to reverse-engineer.
 
-### Phase 2: Discover project structure + infer domains
-
-5. **Scan source directory structure**: Explore the main source directories (`src/`, `app/`, `lib/`, `server/`, `api/`, `internal/`, `pkg/`, etc.) to understand the project layout.
-
-6. **Identify domain boundaries**: Look for groupings that suggest bounded contexts:
-   - **Feature folders**: `src/users/`, `src/orders/`, `src/products/`
-   - **Module folders**: `modules/auth/`, `modules/billing/`
-   - **Route groups**: `routes/users.ts`, `routes/orders.ts`
-   - **Service classes**: `services/UserService`, `services/OrderService`
-   - **Django apps**: each app directory
-   - **NestJS modules**: each module directory
-   - **Go packages**: each package under `internal/` or `pkg/`
-   - **Microservices**: each service directory becomes its own domain
-
-7. **Confirm domains with user**: Present the inferred domain groupings and ask the user to confirm or adjust:
+5. **Count source files** (excluding tests, configs, assets, node_modules, vendor, dist, build) and auto-select strategy unless `--strategy` flag overrides. Show the user:
    ```
-   Inferred domains:
-     1. users — src/users/, src/services/UserService, routes/users.ts
-     2. orders — src/orders/, src/services/OrderService, routes/orders.ts
-     3. notifications — src/notifications/, src/services/NotificationService
-
-   Does this look right? Should I split, merge, or rename any domains?
+   Source files: 247
+   Auto-selected strategy: Bottom-Up (override with --strategy <name>)
    ```
-   If the `--domains` flag was provided, only process those domains.
 
-8. **Map domain ownership**: For each domain, record which source folders, files, and resources belong to it.
+6. **Handle existing specs** (if output directory already has DDD files):
+   - Without `--merge`: warn the user that specs will be overwritten, ask for confirmation
+   - With `--merge`: read existing specs, preserve them, only add new domains/flows/schemas that don't already exist
 
-### Phase 3: Extract data models as schemas
+---
 
-9. **Find data model definitions**: Search for ORM/schema files:
-   - Prisma: `schema.prisma` (parse `model` blocks)
-   - TypeORM: files with `@Entity()` decorator
-   - Drizzle: files using `pgTable()`, `mysqlTable()`, `sqliteTable()`
-   - Sequelize: files using `sequelize.define()` or `Model.init()`
-   - Mongoose: files using `new Schema()` or `mongoose.model()`
-   - SQLAlchemy: classes inheriting `Base` or `db.Model`
-   - Django: classes inheriting `models.Model`
-   - GORM: structs with `gorm` tags
-   - ActiveRecord: classes inheriting `ApplicationRecord`
-   - Raw SQL: `migrations/` folder for schema definitions
-   - If no ORM, look for TypeScript interfaces/types or JSON schemas that represent data models
+## Strategy: Baseline (E6)
 
-10. **For each model, extract**:
-    - Fields: name, type (map to generic types: string, integer, float, boolean, datetime, json, enum, relation), constraints (required, unique, default)
-    - Relationships: belongs_to, has_many, has_one, many_to_many (with foreign key and related model)
-    - Indexes: fields, unique flag
-    - Lifecycle/status fields: if a field has a finite set of values (enum or string with known values), detect state transitions from code that updates this field
-    - Timestamps: created_at, updated_at, deleted_at (soft delete)
+For small codebases (< 30 files) where everything fits in context.
 
-11. **Generate schema specs**:
-    - Create `specs/schemas/_base.yaml` with common fields (id, created_at, updated_at, deleted_at if soft deletes detected)
-    - Create `specs/schemas/{model}.yaml` for each model
-    - Map which domain owns which schemas (based on where the model is imported/used most)
+**B1. Discover domains**: Scan source directory structure. Look for domain boundaries (feature folders, module folders, route groups, service classes, Django apps, NestJS modules, Go packages, microservice dirs). Ask user to confirm domain groupings. If `--domains` flag provided, only process those domains.
 
-### Phase 4: Extract flows from code
+**B2. Extract schemas**: Find ORM/model files (Prisma, TypeORM, Drizzle, Sequelize, Mongoose, SQLAlchemy, Django, GORM, ActiveRecord, migrations, or TypeScript interfaces). For each model extract: fields with types/constraints, relationships, indexes, lifecycle/status fields with transitions, timestamps.
 
-12. **Scan for entry points in each domain**:
+**B3. Extract flows**: For each domain, scan for entry points:
+- HTTP routes → trigger `HTTP {METHOD} {path}`
+- Cron/scheduled jobs → trigger `cron {expression}` with `job_config`
+- Event listeners → trigger `event:{EventName}`
+- WebSocket/SSE → trigger `ws {path}` or `sse {path}`
 
-    **HTTP routes/handlers**:
-    - Express/Fastify/Hono: `router.get()`, `app.post()`, etc.
-    - NestJS: `@Get()`, `@Post()`, etc. decorators on controller methods
-    - Django: `urlpatterns`, `@api_view`, ViewSet methods
-    - FastAPI: `@app.get()`, `@router.post()`, etc.
-    - Rails: `routes.rb` + controller actions
-    - Spring: `@GetMapping`, `@PostMapping`, etc.
-    - Go: `r.HandleFunc()`, `e.GET()`, handler functions
-    - Next.js: `app/api/*/route.ts` or `pages/api/*.ts`
+For each entry point, read the handler and trace through called functions to build the node graph:
+- Validation → `input` node
+- DB operations → `data_store` node (operation, model, query/data)
+- External API calls → `service_call` node (method, url, error_mapping)
+- Conditionals → `decision` node (condition, both branches)
+- Loops → `loop` node; parallel ops → `parallel` node
+- Event publishing → `event` node (direction: emit)
+- LLM/AI calls → `llm_call` node
+- Sub-routine calls → `sub_flow` node
+- Response/return → `terminal` node (outcome, status, body)
+- Error handling → `terminal` on error paths
 
-    For each route: create a flow with trigger `HTTP {METHOD} {path}`.
+Wire connections with proper sourceHandle values. Position nodes vertically (~130px spacing), error terminals to the right (x + 250).
 
-    **Scheduled jobs/cron**:
-    - Bull/BullMQ: `queue.process()`, `@Processor()`
-    - node-cron/cron: `cron.schedule()`, `new CronJob()`
-    - Celery: `@celery.task`, `@periodic_task`
-    - Django: management commands, django-celery-beat
-    - Spring: `@Scheduled`
-    - Go: `cron.AddFunc()`
+**B4. Extract cross-cutting concerns**: Error codes → `shared/errors.yaml`. Shared enums → `shared/types.yaml`. Architecture patterns → `architecture.yaml`. Env vars → `config.yaml`. System + integrations → `system.yaml`.
 
-    For each job: create a flow with trigger `cron {expression}` and add `job_config` to trigger spec.
+**B5. Wire events**: Map publish/consume across domains. Flag unmatched events.
 
-    **Event listeners/consumers**:
-    - EventEmitter: `.on('eventName')`, `.addEventListener()`
-    - Kafka/RabbitMQ consumers: `consumer.subscribe()`, `@Subscribe()`
-    - Redis Pub/Sub: `subscriber.subscribe()`
-    - AWS SQS/SNS: handler functions
-    - Domain events: custom event bus patterns
+**B6. Generate all spec files** and proceed to Quality Checks and Coverage Verification.
 
-    For each listener: create a flow with trigger `event:{EventName}`.
+---
 
-    **WebSocket/SSE handlers**: Create flows with trigger `ws {path}` or `sse {path}`.
+## Strategy: Index (E1)
 
-13. **Trace execution paths**: For each entry point, read the handler function and trace through called functions/methods to build the node graph:
+For medium codebases (30–80 files). Build an in-context index before deep-diving per domain.
 
-    - **Validation logic** (Joi, Zod, class-validator, Pydantic, manual checks) → `input` node with fields and validation rules
-    - **Authorization checks** (middleware, decorators, guards) → `decision` node or security annotation
-    - **Database reads/writes** (ORM calls, raw queries) → `data_store` node with `operation` (create/read/update/delete/upsert), `model`, and `query`/`data`
-    - **External API calls** (fetch, axios, HttpService, requests) → `service_call` node with `method`, `url`, `headers`, `error_mapping`
-    - **Conditional branches** (if/else, switch/case, ternary) → `decision` node with `condition`, wire both `true` and `false`
-    - **Loops/iteration** (for, forEach, map over collections) → `loop` node with `collection` and `iterator`
-    - **Parallel operations** (Promise.all, asyncio.gather, goroutines) → `parallel` node
-    - **Event publishing** (emit, publish, dispatch) → `event` node with `direction: emit`
-    - **LLM/AI calls** (OpenAI, Anthropic, LangChain, etc.) → `llm_call` node with `model` and `prompt_template`
-    - **Sub-routine calls** (calling another flow's handler) → `sub_flow` node with `flow_ref`
-    - **Response/return** (res.json, return Response, ctx.JSON) → `terminal` node with `outcome`, `status`, `body`
-    - **Error handling** (try/catch, error middleware, rescue) → `terminal` node on error paths with appropriate error code
+**I1. Build index**: Do a quick scan of ALL source files — read only imports, exports, class/function declarations, route registrations, and model definitions (skip function bodies). Build an in-context index:
+```
+Files by domain:
+  users/: controller.ts (5 routes), service.ts (8 methods), model.ts (User)
+  orders/: controller.ts (4 routes), service.ts (6 methods), model.ts (Order, OrderItem)
+  ...
 
-14. **Wire connections**: Connect nodes with proper `sourceHandle` values:
-    - `input` → `"valid"` / `"invalid"`
-    - `decision` → `"true"` / `"false"`
-    - `data_store` → `"success"` / `"error"`
-    - `service_call` → `"success"` / `"error"`
-    - `loop` → `"body"` / `"done"`
-    - `parallel` → `"branch-0"`, `"branch-1"`, ... / `"done"`
-    - All other nodes → single output connection
+Entry points: POST /api/users/register, POST /api/users/login, ...
+Models: User, Order, OrderItem, Payment, ...
+```
 
-15. **Position nodes**: Place nodes vertically with ~130px spacing. Branch error/invalid terminals to the right (x + 250). Start trigger at y=0.
+**I2. Confirm domains** with the user using the index.
 
-### Phase 5: Extract cross-cutting concerns
+**I3. Process per-domain**: For each domain, read ONLY that domain's files in full. Extract schemas, flows, and cross-cutting concerns for that domain. Generate that domain's spec files. Then discard the domain's source from working memory and move to the next.
 
-16. **Error codes and constants**:
-    - Find error code definitions, HTTP status mappings, error message constants
-    - Generate `specs/shared/errors.yaml` with at minimum: VALIDATION_ERROR, UNAUTHORIZED, FORBIDDEN, NOT_FOUND, DUPLICATE_ENTRY, RATE_LIMITED, INTERNAL_ERROR
-    - Add any project-specific error codes found in the source
+**I4. Wire events** across all domains using the generated domain.yaml files.
 
-17. **Shared types and enums**:
-    - Find enums, constants, and value objects reused across 2+ domains
-    - Generate `specs/shared/types.yaml`
+**I5. Generate system-level specs** (system.yaml, architecture.yaml, config.yaml, shared/).
 
-18. **Architecture conventions**:
-    - Infer project structure patterns, naming conventions (file naming, function naming), layer architecture (controller/service/repository)
-    - Detect testing framework and patterns
-    - Generate `specs/architecture.yaml`
+Proceed to Quality Checks and Coverage Verification.
 
-19. **Configuration**:
-    - Collect all environment variables from `.env.example`, `process.env` references, `os.environ`, config files
-    - Categorize as required vs optional, group by concern (database, auth, external services, etc.)
-    - Generate `specs/config.yaml`
+---
 
-20. **System-level spec**:
-    - Generate `specs/system.yaml` with project identity, tech stack, environments
-    - If external integrations are detected (third-party APIs, payment providers, email services, etc.), add an `integrations` section with base_url, auth, rate_limits, retry, timeout_ms per integration
+## Strategy: Swap (E2)
 
-### Phase 6: Wire events across domains
+For medium-large codebases (80–150 files). Write a persistent index layer to disk, then read selectively.
 
-21. **Map event publishing**: For each `event` node with `direction: emit`, add an entry to the owning domain's `publishes_events` in `domain.yaml`:
-    - `name`: the event name
-    - `from_flow`: the flow that publishes it
-    - `payload`: infer the event data shape from what's passed to the emit/publish call
+**S1. Scan to disk**: Walk every source file, read only the first ~50 lines (imports, declarations, route registrations). Write structured index files to `.ddd/reverse/`:
 
-22. **Map event consumption**: For each flow triggered by `event:{EventName}`, add to the consuming domain's `consumes_events`:
-    - `name`: the event name
-    - `handled_by_flow`: the flow that processes it
+```yaml
+# .ddd/reverse/structure.yaml — file tree with annotations
+src/users/:
+  controller.ts: "Express router, 5 routes: register, login, getProfile, updateProfile, deleteAccount"
+  service.ts: "UserService, 8 methods"
+  model.ts: "Prisma model: User"
+src/orders/:
+  controller.ts: "Express router, 4 routes"
+  ...
+```
 
-23. **Cross-reference**: Match publishers to consumers across domains. Flag any unmatched events:
-    - Events published but never consumed → warning
-    - Events consumed but never published → warning (may come from external systems)
+```yaml
+# .ddd/reverse/entry-points.yaml — one line per entry point
+routes:
+  - { method: POST, path: /api/users/register, file: src/users/controller.ts, line: 15, handler: register }
+  - { method: POST, path: /api/users/login, file: src/users/controller.ts, line: 42, handler: login }
+  ...
+events:
+  - { name: UserRegistered, type: publish, file: src/users/service.ts, line: 89 }
+  ...
+cron:
+  - { expression: "0 * * * *", file: src/jobs/cleanup.ts, line: 5 }
+```
 
-### Phase 7: Quality checks + output
+```yaml
+# .ddd/reverse/models.yaml — fields + relationships, no implementation
+User:
+  file: src/users/model.ts
+  fields: [id, email, name, passwordHash, role, createdAt, updatedAt]
+  relations: [has_many: Order, has_one: Profile]
+  ...
+```
 
-24. **Handle existing specs** (if output directory already has DDD files):
-    - Without `--merge`: warn the user that specs will be overwritten, ask for confirmation
-    - With `--merge`: read existing specs, preserve them, only add new domains/flows/schemas that don't already exist. If a flow already exists in specs, skip it (don't overwrite)
+**S2. Infer domains** from structure.yaml. Ask user to confirm. Write to `.ddd/reverse/domains.yaml`.
 
-25. **Quality checks**: Before writing files, verify:
-    - Every flow has exactly one trigger
-    - All paths from trigger reach a terminal node (no dead ends)
-    - No orphaned nodes (all reachable from trigger)
-    - Decision nodes have both true and false branches wired
-    - Input nodes have valid/invalid paths wired
-    - Data store nodes have success/error paths wired
-    - Service call nodes have success/error paths wired
-    - Terminal nodes have `status` and `body` for HTTP-triggered flows
-    - Error terminals reference error codes from `specs/shared/errors.yaml`
-    - Published events have matching consumers across domains (or note warnings)
-    - Schema models referenced by `data_store` nodes exist in `specs/schemas/`
-    - Shared enums referenced by schemas exist in `specs/shared/types.yaml`
+**S3. Extract flows**: For each entry point in entry-points.yaml, read ONLY the handler file + its direct dependencies (1–3 files). Generate the flow spec. Write to specs/. Move on.
 
-26. **Generate `ddd-project.json`**: List all domains with name and description.
+**S4. Generate schemas** from models.yaml (read source files only if model details are insufficient).
 
-27. **Write all spec files** to the output directory using the standard structure:
-    ```
-    {output}/
-      ddd-project.json
-      specs/
-        system.yaml
-        architecture.yaml
-        config.yaml
-        shared/
-          errors.yaml
-          types.yaml (if shared enums exist)
-        schemas/
-          _base.yaml
-          {model}.yaml
-        domains/
-          {domain-id}/
-            domain.yaml
-            flows/
-              {flow-id}.yaml
-    ```
+**S5. Extract cross-cutting concerns and wire events** by reading the index files + generated specs.
 
-28. **Node ID convention**: Use `{type}-{8-char-random}` format (e.g., `input-xK9mR2vL`, `process-aPq3nW8j`).
+**S6. Generate system-level specs.** Proceed to Quality Checks and Coverage Verification.
 
-29. **Summary**: After creating all files, show:
-    ```
-    Reverse-engineered DDD Project: {project-name}
+The `.ddd/reverse/` files persist — if the session is interrupted, resume from where you left off by reading these files.
 
-    Tech stack: {language} / {framework} / {database}
+---
 
-    Domains:
-      users (4 flows, 2 schemas)
-      orders (3 flows, 3 schemas)
-      notifications (2 flows, 0 schemas)
+## Strategy: Bottom-Up (E3)
 
-    Schemas: user, session, order, order_item, payment
-    Total flows: 9
+For large codebases (150–300 files). Start from the smallest units (L3 flows), group into domains (L2), then build the system map (L1).
 
-    Files created:
-      ddd-project.json
-      specs/system.yaml
-      specs/architecture.yaml
-      specs/config.yaml
-      specs/shared/errors.yaml
-      specs/shared/types.yaml
-      specs/schemas/_base.yaml
-      specs/schemas/user.yaml
-      ...
-      specs/domains/users/domain.yaml
-      specs/domains/users/flows/user-register.yaml
-      ...
+**BU1. Grep for all entry points** (L3 scan): Pattern-match across all files for route registrations, event handlers, cron jobs, WebSocket handlers. Do NOT read full file contents — just find the signatures. Write results to `.ddd/reverse/entry-points.yaml`.
+```
+Found 47 entry points:
+  POST /api/users/register     → src/users/controller.ts:15
+  POST /api/users/login        → src/users/controller.ts:42
+  event:UserRegistered         → src/notifications/handlers.ts:9
+  cron 0 */6 * * *             → src/jobs/cleanup.ts:5
+  ...
+```
 
-    Event wiring:
-      UserRegistered: users → notifications
-      OrderCreated: orders → notifications
-      PaymentProcessed: orders → (no consumer — warning)
+**BU2. Extract each flow independently** (L3 deep): For each entry point, read ONLY that handler + the 1–2 files it directly calls. Build the node graph. Write the flow spec to a temporary location `.ddd/reverse/flows/{flow-id}.yaml`. Then move on — never hold more than one flow's code in context at a time.
 
-    Warnings:
-      - PaymentProcessed event has no consumer
-      - orders/refund-order: complex switch/case simplified to decision chain
+**BU3. Extract models** by scanning for ORM/schema files. Write to `.ddd/reverse/models.yaml`.
 
-    Next steps:
-      1. Open the project in DDD Tool to visualize and review
-      2. Refine any flows that were simplified during extraction
-      3. Run /ddd-implement --all to verify round-trip (generated code should match original)
-    ```
+**BU4. Group into domains** (L3 → L2): Read only the flow metadata (triggers, referenced models, file paths) from the generated flow specs — NOT source code. Group flows by shared folders, shared models, and import relationships. Ask user to confirm domain groupings.
+
+**BU5. Build domain specs** (L2): Create domain.yaml files. Move flow specs from `.ddd/reverse/flows/` to `specs/domains/{domain}/flows/`. Wire events within and across domains.
+
+**BU6. Build system specs** (L2 → L1): Read only domain.yaml files and schema specs. Generate system.yaml, architecture.yaml, config.yaml, shared/.
+
+**BU7. Orphan sweep**: Compare all source files against files referenced by any flow. Report unreferenced files — they may be missed entry points, shared utilities, or dead code.
+
+Proceed to Quality Checks and Coverage Verification.
+
+---
+
+## Strategy: Compiler (E4)
+
+For large codebases (300–500 files). Full multi-pass pipeline with intermediate representations on disk, like a compiler building an executable.
+
+### Pass 1: Scan (Lexer)
+Process each source file independently. Extract "tokens" — no deep reading, just classify what each file contains:
+
+```yaml
+# .ddd/reverse/tokens/{file-hash}.yaml — one per source file
+file: src/users/controller.ts
+type: controller
+imports: [UserService, RegisterDto, LoginDto]
+exports: [router]
+tokens:
+  - { kind: route, method: POST, path: /api/users/register, handler: register, line: 15 }
+  - { kind: route, method: POST, path: /api/users/login, handler: login, line: 42 }
+```
+
+One file at a time. This pass is pure pattern matching.
+
+### Pass 2: Extract (Parser)
+Read all token files (small), build a unified symbol table:
+
+```yaml
+# .ddd/reverse/symbols/routes.yaml — all entry points
+# .ddd/reverse/symbols/models.yaml — all data models
+# .ddd/reverse/symbols/functions.yaml — all exported functions/classes with file:line
+# .ddd/reverse/symbols/imports.yaml — dependency graph (who imports what)
+```
+
+The symbol table is the map of the entire codebase without holding any source in context.
+
+### Pass 3: Resolve (Semantic Analysis)
+For each entry point in routes.yaml, follow the import graph to find handler + dependencies (1–3 files). Read those source files and build a call chain:
+
+```yaml
+# .ddd/reverse/chains/{entry-point-id}.yaml
+entry: POST /api/users/register
+file: src/users/controller.ts:15
+chain:
+  - { call: validateRegister, type: validation, file: src/users/dto.ts:5 }
+  - { call: userService.findByEmail, type: db_read, model: User }
+  - { call: "if exists", type: branch, true: "return 409", false: continue }
+  - { call: userService.create, type: db_create, model: User }
+  - { call: emit(UserRegistered), type: event_emit }
+  - { call: "return 201", type: response, status: 201 }
+```
+
+This is where the LLM enters — classifying what each call does. Context is tiny: one handler at a time.
+
+### Pass 4: IR (Intermediate Representation)
+Transform each call chain into DDD node primitives:
+
+```yaml
+# .ddd/reverse/ir/{flow-id}.yaml
+trigger: { event: "HTTP POST /api/users/register" }
+nodes:
+  - { type: input, fields: [email, password, name], validation: RegisterDto }
+  - { type: data_store, op: read, model: User, purpose: check_duplicate }
+  - { type: decision, condition: "user exists", true: error_409, false: continue }
+  - { type: data_store, op: create, model: User }
+  - { type: event, direction: emit, name: UserRegistered }
+  - { type: terminal, status: 201, body: { user, token } }
+references: { models: [User], services: [emailService], events: [UserRegistered] }
+```
+
+Each IR file is self-contained — like a .o object file.
+
+### Pass 5: Link (Linker)
+Read ALL IR files + symbols/models.yaml (all compact). Resolve cross-references:
+
+```yaml
+# .ddd/reverse/linked/domains.yaml — flow → domain assignments
+# .ddd/reverse/linked/events.yaml — publisher ↔ consumer mapping
+# .ddd/reverse/linked/schemas.yaml — model → domain ownership
+# .ddd/reverse/linked/shared.yaml — cross-domain types, errors
+```
+
+Ask user to confirm domain groupings.
+
+### Pass 6: Emit (Code Generation)
+Generate final DDD YAML specs from linked IR. Each IR file → flow spec. Each domain group → domain.yaml. Models → schema specs. Cross-cutting → system-level specs.
+
+Proceed to Quality Checks and Coverage Verification.
+
+---
+
+## Strategy: Codex (E5)
+
+For very large codebases (500+ files). Compress the entire codebase to a reference vocabulary where every code unit gets a short ref code + one-line explanation.
+
+### C1: Assign ref codes
+Walk each source file. For every function, method, class, or handler, assign a ref code and write what it does. Process one file at a time — never read more than one file in context.
+
+**Ref code format**: `{DomainPrefix}.{TypePrefix}{##}`
+
+| Type prefix | Meaning |
+|---|---|
+| `R` | Route/handler entry point |
+| `V` | Validation logic |
+| `S` | Service/business logic |
+| `D` | Database operation |
+| `X` | External API call |
+| `E` | Event emit/consume |
+| `M` | Middleware |
+| `T` | Transform/utility |
+| `G` | Guard/auth check |
+
+Domain prefix: first letter(s) of inferred domain. Use `_` for shared/cross-cutting code.
+
+Write the codex to disk:
+```yaml
+# .ddd/reverse/codex.yaml
+U.R01: { fn: register,        file: src/users/controller.ts:15, does: "handle POST /api/users/register" }
+U.R02: { fn: login,           file: src/users/controller.ts:42, does: "handle POST /api/users/login" }
+U.V01: { fn: validateRegister, file: src/users/dto.ts:5,        does: "validate email format, password strength, name required" }
+U.S01: { fn: findByEmail,     file: src/users/service.ts:23,    does: "DB read User by email, return null if not found" }
+U.S02: { fn: create,          file: src/users/service.ts:45,    does: "hash password, DB create User, return user object" }
+U.E01: { fn: emitRegistered,  file: src/users/events.ts:12,     does: "emit UserRegistered { userId, email }" }
+O.R01: { fn: createOrder,     file: src/orders/controller.ts:10, does: "handle POST /api/orders" }
+O.X01: { fn: chargePayment,   file: src/orders/payment.ts:8,    does: "POST to Stripe /charges" }
+_.M01: { fn: authMiddleware,   file: src/middleware/auth.ts:5,   does: "verify JWT, attach user to req, 401 if invalid" }
+# ... entire codebase in ~200-400 lines
+```
+
+### C2: Map call chains as ref code sequences
+For each entry point (R-type ref code), read ONLY that handler to determine the call order. Express as ref code chain:
+
+```yaml
+# .ddd/reverse/chains.yaml
+user-register:
+  entry: U.R01
+  guard: [_.M02]
+  chain: U.V01 → U.S01 → if exists → 409 | U.S02 → U.S03 → U.E01 → 201
+
+user-login:
+  entry: U.R02
+  chain: U.V02 → U.S01 → if !found → 404 | U.S04 → if !match → 401 | U.S03 → 200
+
+create-order:
+  entry: O.R01
+  guard: [_.M01, _.M02]
+  chain: O.V01 → O.S01 → if unavail → 400 | O.S02 → O.X01 → if fail → 402 | O.D01 → O.E01 → 201
+```
+
+The entire application's behavior in ~50 lines, regardless of codebase size.
+
+### C3: Confirm domains
+Show the user the codex grouped by domain prefix. Ask them to confirm/adjust domain groupings.
+
+### C4: Build DDD specs from codex + chains
+Now read ONLY codex.yaml + chains.yaml (both small — always fit in context). Map ref codes to DDD node types:
+- `V` codes → `input` node
+- `D` codes → `data_store` node
+- `X` codes → `service_call` node
+- `E` codes → `event` node
+- `S` codes → `process` node
+- `M`/`G` codes → `decision` node or security annotation
+- `T` codes → `process` node
+- `if`/branching → `decision` node
+- status codes at chain end → `terminal` node
+
+Generate all flow specs, domain specs, schema specs, and system-level specs.
+
+### C5: Orphan detection
+Any source file without ref codes assigned = not scanned. Any ref code not appearing in any chain = orphaned logic. Report both.
+
+Proceed to Quality Checks and Coverage Verification.
+
+---
+
+## Quality Checks (all strategies)
+
+Before writing final spec files, verify:
+- Every flow has exactly one trigger
+- All paths from trigger reach a terminal node (no dead ends)
+- No orphaned nodes (all reachable from trigger)
+- Decision nodes have both true and false branches wired
+- Input nodes have valid/invalid paths wired
+- Data store nodes have success/error paths wired
+- Service call nodes have success/error paths wired
+- Terminal nodes have `status` and `body` for HTTP-triggered flows
+- Error terminals reference error codes from `specs/shared/errors.yaml`
+- Published events have matching consumers across domains (or note warnings)
+- Event `payload` fields match between publisher and consumer
+- Schema models referenced by `data_store` nodes exist in `specs/schemas/`
+- Shared enums referenced by schemas exist in `specs/shared/types.yaml`
+
+---
+
+## Coverage Verification (all strategies)
+
+After generating specs, measure how much of the codebase is represented. Write coverage report to `.ddd/reverse/coverage.yaml` AND display to the user.
+
+**Metrics to compute:**
+
+1. **File coverage**: source files referenced by at least one flow vs total source files
+2. **Entry point coverage**: routes/handlers/jobs in code vs trigger nodes in specs
+3. **Model coverage**: data models in ORM vs schema specs generated
+4. **Event coverage**: events published/consumed in code vs event nodes in specs
+5. **Function coverage**: exported functions vs functions referenced in flows
+
+**Coverage report format:**
+```yaml
+# .ddd/reverse/coverage.yaml
+overall: 91%
+
+files:
+  total: 52
+  covered: 47
+  excluded: 3         # tests, configs, assets
+  missed: 2           # genuine gaps
+  missed_list:
+    - src/webhooks/stripe.ts    # "likely a missing flow"
+    - src/jobs/migrate.ts       # "likely a missing flow"
+
+entry_points:
+  total: 23
+  covered: 21
+  missed:
+    - "GET /api/admin/stats"
+    - "POST /api/webhooks/stripe"
+
+models:
+  total: 8
+  covered: 8
+
+events:
+  published: 5
+  consumed: 4
+  unmatched:
+    - { name: PaymentFailed, direction: publish, no_consumer: true }
+
+functions:
+  total: 134
+  covered: 98
+  utility: 30           # not flow logic, expected
+  missed: 6
+```
+
+**Display to user:**
+```
+Coverage: 91% (47/52 files, 21/23 entry points, 8/8 models)
+
+Missed entry points:
+  GET  /api/admin/stats      → src/admin/controller.ts:12
+  POST /api/webhooks/stripe  → src/webhooks/stripe.ts:5
+
+Unmatched events:
+  PaymentFailed (published, no consumer)
+
+Unreferenced files:
+  src/webhooks/stripe.ts     → likely a missing flow
+  src/jobs/migrate.ts        → likely a missing flow
+
+Action: run /ddd-reverse with --domains to add missing flows, or manually create them in DDD Tool.
+```
+
+---
+
+## Output Format (all strategies)
+
+### File structure
+```
+{output}/
+  ddd-project.json
+  specs/
+    system.yaml
+    architecture.yaml
+    config.yaml
+    shared/
+      errors.yaml
+      types.yaml (if shared enums exist)
+    schemas/
+      _base.yaml
+      {model}.yaml
+    domains/
+      {domain-id}/
+        domain.yaml
+        flows/
+          {flow-id}.yaml
+```
+
+### Node ID convention
+Use `{type}-{8-char-random}` format (e.g., `input-xK9mR2vL`, `process-aPq3nW8j`).
+
+### Node positioning
+Place nodes vertically with ~130px spacing. Branch error/invalid terminals to the right (x + 250). Start trigger at y=0.
+
+### Connection wiring
+Wire with proper `sourceHandle` values:
+- `input` → `"valid"` / `"invalid"`
+- `decision` → `"true"` / `"false"`
+- `data_store` → `"success"` / `"error"`
+- `service_call` → `"success"` / `"error"`
+- `loop` → `"body"` / `"done"`
+- `parallel` → `"branch-0"`, `"branch-1"`, ... / `"done"`
+- All other nodes → single output connection
+
+### Summary report
+After creating all files, show:
+```
+Reverse-engineered DDD Project: {project-name}
+Strategy used: {strategy-name}
+
+Tech stack: {language} / {framework} / {database}
+
+Domains:
+  users (4 flows, 2 schemas)
+  orders (3 flows, 3 schemas)
+  notifications (2 flows, 0 schemas)
+
+Schemas: user, session, order, order_item, payment
+Total flows: 9
+
+Coverage: {overall}% ({files covered}/{files total} files, {entry points covered}/{total} entry points, {models covered}/{total} models)
+
+Files created:
+  ddd-project.json
+  specs/system.yaml
+  specs/architecture.yaml
+  specs/config.yaml
+  specs/shared/errors.yaml
+  ...
+  specs/domains/users/domain.yaml
+  specs/domains/users/flows/user-register.yaml
+  ...
+
+Event wiring:
+  UserRegistered: users → notifications
+  OrderCreated: orders → notifications
+  PaymentProcessed: orders → (no consumer — warning)
+
+Warnings:
+  - PaymentProcessed event has no consumer
+  - 2 entry points not captured (see coverage report)
+  - orders/refund-order: complex switch/case simplified to decision chain
+
+Next steps:
+  1. Review coverage report at .ddd/reverse/coverage.yaml
+  2. Open the project in DDD Tool to visualize and review
+  3. Add any missing flows flagged in coverage report
+  4. Run /ddd-implement --all to verify round-trip
+```
+
+---
 
 ## Node Type Reference
-
-When creating nodes during extraction, use the correct spec structure for each type:
 
 | Type | Required Spec Fields | Connections |
 |------|---------------------|-------------|
