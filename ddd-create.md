@@ -1,6 +1,6 @@
 # DDD Create
 
-Create a complete DDD (Domain-Driven Design) project from a software project description. Generates all YAML spec files that the DDD Tool can visualize and `/ddd-implement` can turn into code.
+Create a complete DDD (Design Driven Development) project from a software project description. Generates all YAML spec files that the DDD Tool can visualize and `/ddd-implement` can turn into code.
 
 ## Instructions
 
