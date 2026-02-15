@@ -4,7 +4,7 @@ Create a complete DDD (Domain-Driven Design) project from a software project des
 
 ## Instructions
 
-1. **Read the DDD Usage Guide**: Read `~/code/ddd-tool/DDD-USAGE-GUIDE.md` to understand all YAML formats, node types, spec fields, connection patterns, and conventions. This is your primary reference for creating correct specs.
+1. **Read the DDD Usage Guide**: Read `~/code/DDD/DDD-USAGE-GUIDE.md` to understand all YAML formats, node types, spec fields, connection patterns, and conventions. This is your primary reference for creating correct specs.
 
 2. **Understand the project**: Read the user's description from `$ARGUMENTS`. If the description is brief, ask clarifying questions:
    - What does the software do? (purpose, target users)
